@@ -44,6 +44,12 @@ git_pull:
 		--command="cd ${CHECKOUT_DIR} && git pull" \
 		-- -A
 
+.PHONY: 
+run_setup:
+	$(BASE_CMD) ssh $(NAME)  \
+		--command="cd ${CHECKOUT_DIR} && bash tpu.sh" \
+		-- -A
+
 .PHONY: connect
 connect:
 	$(BASE_CMD) ssh $(NAME)

@@ -22,7 +22,7 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from rich.pretty import pprint
 from tensorboardX import SummaryWriter
-
+ 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
 os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false " "intra_op_parallelism_threads=1"

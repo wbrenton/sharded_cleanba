@@ -7,7 +7,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import List, NamedTuple, Optional, Sequence, Tuple
+from typing import List, NamedTuple, Optional, Sequence, Tuple, Dict
 from functools import partial
 
 import envpool
@@ -23,6 +23,8 @@ from flax.training.train_state import TrainState
 from rich.pretty import pprint
 from tensorboardX import SummaryWriter
 
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as PSpec
+
 # # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
 # os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false " "intra_op_parallelism_threads=1"
@@ -30,6 +32,8 @@ from tensorboardX import SummaryWriter
 # os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic_reductions"
 # os.environ["TF_CUDNN DETERMINISTIC"] = "1"
 
+PRNGKey = jax.Array
+Params = Dict[str, flax.core.FrozenDict]
 
 @dataclass
 class Args:
@@ -115,7 +119,7 @@ class Args:
     batch_size: int = 0
     minibatch_size: int = 0
     num_updates: int = 0
-    global_learner_decices: Optional[List[str]] = None
+    global_learner_devices: Optional[List[str]] = None
     actor_devices: Optional[List[str]] = None
     learner_devices: Optional[List[str]] = None
 
@@ -219,29 +223,21 @@ class Transition(NamedTuple):
 
 
 def rollout(
-    key: jax.random.PRNGKey,
-    args,
-    rollout_queue,
+    key: PRNGKey,
+    args: Args,
+    rollout_queue: queue.Queue,
     params_queue: queue.Queue,
-    writer,
-    learner_devices,
-    device_thread_id,
-    actor_device,
+    writer: SummaryWriter,
+    learner_sharding: NamedSharding,
+    device_thread_id: int,
+    actor_device: jax.Device,
     ):
-    envs = make_env(
-        args.env_id,
-        args.seed + jax.process_index() + device_thread_id,
-        args.local_num_envs,
-    )()
-    len_actor_device_ids = len(args.actor_device_ids)
-    global_step = 0
-    start_time = time.time()
 
     @jax.jit
     def get_action_and_value(
-        params: flax.core.FrozenDict,
-        next_obs: np.ndarray,
-        key: jax.random.PRNGKey,
+        params: Params,
+        next_obs: jax.Array,
+        key: PRNGKey,
     ):
         hidden = Network(args.channels, args.hiddens).apply(params['torso'], next_obs)
         logits = Actor(envs.single_action_space.n).apply(params['actor'], hidden)
@@ -253,6 +249,10 @@ def rollout(
         logprob = jax.nn.log_softmax(logits)[jnp.arange(action.shape[0]), action]
         value = Critic().apply(params['critic'], hidden)
         return next_obs, action, logprob, value.squeeze(), key
+    
+    @jax.jit
+    def prepare_data(storage: List[Transition]) -> Transition:
+        return jax.tree_map(lambda *xs: jnp.stack(xs).swapaxes(0, 1), *storage) # TODO: switch to einops
 
     # put data in the last index
     episode_returns = np.zeros((args.local_num_envs,), dtype=np.float32)
@@ -264,12 +264,18 @@ def rollout(
     rollout_time = deque(maxlen=10)
     rollout_queue_put_time = deque(maxlen=10)
     actor_policy_version = 0
-    next_obs, _ = envs.reset()
+    len_actor_device_ids = len(args.actor_device_ids)
     next_done = jnp.zeros(args.local_num_envs, dtype=jax.numpy.bool_)
-
-    @jax.jit
-    def prepare_data(storage: List[Transition]) -> Transition:
-        return jax.tree_map(lambda *xs: jnp.split(jnp.stack(xs), len(learner_devices), axis=1), *storage)
+    
+    envs = make_env(
+        args.env_id,
+        args.seed + jax.process_index() + device_thread_id,
+        args.local_num_envs,
+    )()
+    
+    global_step = 0
+    next_obs, _ = envs.reset()
+    start_time = time.time()
 
     for update in range(1, args.num_updates + 2):
         update_time_start = time.time()
@@ -300,15 +306,15 @@ def rollout(
         rollout_time_start = time.time()
         storage = []
         for _ in range(0, args.num_steps):
-            cached_next_obs = jnp.array(next_obs)
-            cached_next_done = next_done
+            cached_next_obs = jax.device_put(next_obs, actor_device)
+            cached_next_done = jax.device_put(next_done, actor_device)
             global_step += len(next_done) * args.actor_threads_per_device * len_actor_device_ids * args.world_size
             inference_time_start = time.time()
             cached_next_obs, action, logprob, value, key = get_action_and_value(params, cached_next_obs, key)
             inference_time += time.time() - inference_time_start
 
             d2h_time_start = time.time()
-            cpu_action = np.array(action)
+            cpu_action = jax.device_get(action)
             d2h_time += time.time() - d2h_time_start
 
             env_send_time_start = time.time()
@@ -348,11 +354,9 @@ def rollout(
         rollout_time.append(time.time() - rollout_time_start)
 
         avg_episodic_return = np.mean(returned_episode_returns)
-        partitioned_storage = prepare_data(storage)
-        sharded_storage = Transition(
-            *list(map(lambda x: jax.device_put_sharded(x, devices=learner_devices), partitioned_storage))
-        )
-        # next_obs, next_done are still in the host
+        stacked_storage = prepare_data(storage)
+        sharded_storage = jax.device_put(stacked_storage, learner_sharding)
+        # next_obs, next_done are still in the host # TODO WHY
         sharded_next_obs = jax.device_put_sharded(np.split(next_obs, len(learner_devices)), devices=learner_devices)
         sharded_next_done = jax.device_put_sharded(np.split(next_done, len(learner_devices)), devices=learner_devices)
         payload = (
@@ -398,6 +402,43 @@ def rollout(
                 ),
                 global_step,
             )
+            
+def make_agent_state(args: Args):
+
+    def linear_schedule(count):
+        # anneal learning rate linearly after one training iteration which contains
+        # (args.num_minibatches) gradient updates
+        frac = 1.0 - (count // (args.num_minibatches * args.update_epochs)) / args.num_updates
+        return args.learning_rate * frac
+
+    network = Network(args.channels, args.hiddens)
+    actor = Actor(action_dim=envs.single_action_space.n)
+    critic = Critic()
+
+    hidden, network_params = network.init_with_output(network_key, np.array([envs.single_observation_space.sample()]))
+    agent_state = TrainState.create(
+        apply_fn=None,
+        params=dict(
+            torso=network_params,
+            actor=actor.init(actor_key, hidden),
+            critic=critic.init(critic_key, hidden),
+        ),
+        tx=optax.MultiSteps(
+            optax.chain(
+                optax.clip_by_global_norm(args.max_grad_norm),
+                optax.inject_hyperparams(optax.adam)(
+                    learning_rate=linear_schedule if args.anneal_lr else args.learning_rate, eps=1e-5
+                ),
+            ),
+            every_k_schedule=args.gradient_accumulation_steps,
+        ),
+    )
+    
+    print(network.tabulate(network_key, np.array([envs.single_observation_space.sample()])))
+    print(actor.tabulate(actor_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))))
+    print(critic.tabulate(critic_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))))
+
+    return agent_state
 
 # move to dynamic local_num_envs
 # create thread_num_envs
@@ -405,8 +446,11 @@ def rollout(
 
 # goal here is to use sharded api
 
-# before we do anything with the config, let's remove anything that casues a soft error 
+# before we do anything with the config, let's remove anything that casues a soft error
 
+# compare using vairables for network or reinstating the network inside of jits
+
+# how does instadeep go about concatening a transition into one big pytree
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -420,15 +464,22 @@ if __name__ == "__main__":
     global_devices = jax.devices()
     learner_devices = [local_devices[d_id] for d_id in args.learner_device_ids]
     actor_devices = [local_devices[d_id] for d_id in args.actor_device_ids]
-    global_learner_decices = [
+    global_learner_devices = [
         global_devices[d_id + process_index * len(local_devices)]
         for process_index in range(args.world_size)
         for d_id in args.learner_device_ids
     ]
-    print("global_learner_decices", global_learner_decices)
-    args.global_learner_decices = [str(item) for item in global_learner_decices]
+    print("global_learner_devices", global_learner_devices)
+    args.global_learner_devices = [str(item) for item in global_learner_devices]
     args.actor_devices = [str(item) for item in actor_devices]
     args.learner_devices = [str(item) for item in learner_devices]
+    
+    # sharding (TODO: look at how other projects do this, whats the cleanest way)
+    mesh = Mesh(global_learner_devices) # do I want to use global or local?
+    def sharding(*partitions):
+        return NamedSharding(mesh, PSpec(partitions))
+
+    learner_sharding = NamedSharding(mesh, PSpec("i"))
 
     args.local_batch_size = int(args.local_num_envs * args.num_steps * args.actor_threads_per_device * len(args.actor_device_ids))
     args.local_minibatch_size = int(args.local_batch_size // args.num_minibatches)
@@ -468,57 +519,27 @@ if __name__ == "__main__":
     # seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
-    key = jax.random.PRNGKey(args.seed)
+    key = jax.random.key(args.seed)
     key, network_key, actor_key, critic_key = jax.random.split(key, 4)
     learner_keys = jax.device_put_replicated(key, learner_devices)
 
-    # env setup
+    # envs setup
     envs = make_env(args.env_id, args.seed, args.local_num_envs)()
 
-    def linear_schedule(count):
-        # anneal learning rate linearly after one training iteration which contains
-        # (args.num_minibatches) gradient updates
-        frac = 1.0 - (count // (args.num_minibatches * args.update_epochs)) / args.num_updates
-        return args.learning_rate * frac
+    # agent setup
+    agent_state = make_agent_state(args, envs)
+    agent_state = jax.device_put(agent_state, sharding(None))
 
-    network = Network(args.channels, args.hiddens)
-    actor = Actor(action_dim=envs.single_action_space.n)
-    critic = Critic()
-    network_params = network.init(network_key, np.array([envs.single_observation_space.sample()]))
-    agent_state = TrainState.create(
-        apply_fn=None,
-        params=dict(
-            torso=network_params,
-            actor=actor.init(actor_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))),
-            critic=critic.init(critic_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))),
-        ),
-        tx=optax.MultiSteps(
-            optax.chain(
-                optax.clip_by_global_norm(args.max_grad_norm),
-                optax.inject_hyperparams(optax.adam)(
-                    learning_rate=linear_schedule if args.anneal_lr else args.learning_rate, eps=1e-5
-                ),
-            ),
-            every_k_schedule=args.gradient_accumulation_steps,
-        ),
-    )
-    agent_state = flax.jax_utils.replicate(agent_state, devices=learner_devices)
-    print(network.tabulate(network_key, np.array([envs.single_observation_space.sample()])))
-    print(actor.tabulate(actor_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))))
-    print(critic.tabulate(critic_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))))
-
-    @jax.jit
     def get_value(
-        params: flax.core.FrozenDict,
-        obs: np.ndarray,
+        params: Params,
+        obs: jax.Array,
     ):
         hidden = Network(args.channels, args.hiddens).apply(params['torso'], obs)
         value = Critic().apply(params['critic'], hidden).squeeze(-1)
         return value
 
-    @jax.jit
     def get_logprob_entropy_value(
-        params: flax.core.FrozenDict,
+        params: Params,
         obs: np.ndarray,
         actions: np.ndarray,
     ):
@@ -543,7 +564,6 @@ if __name__ == "__main__":
 
     compute_gae_once = partial(compute_gae_once, gamma=args.gamma, gae_lambda=args.gae_lambda)
 
-    @jax.jit
     def compute_gae(
         agent_state: TrainState,
         next_obs: np.ndarray,
@@ -579,13 +599,12 @@ if __name__ == "__main__":
         loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
         return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
 
-    @jax.jit
     def single_device_update(
         agent_state: TrainState,
         sharded_storages: List,
         sharded_next_obs: List,
         sharded_next_done: List,
-        key: jax.random.PRNGKey,
+        key: PRNGKey,
     ):
         storage = jax.tree_map(lambda *x: jnp.hstack(x), *sharded_storages)
         next_obs = jnp.concatenate(sharded_next_obs)
@@ -656,10 +675,9 @@ if __name__ == "__main__":
         approx_kl = jax.lax.pmean(approx_kl, axis_name="local_devices").mean()
         return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key
 
-    multi_device_update = jax.pmap(
+    multi_device_update = jax.jit(
         single_device_update,
-        axis_name="local_devices",
-        devices=global_learner_decices,
+        in_shardings=(sharding(None), sharding('i'), sharding(None))
     )
 
     params_queues = []
@@ -667,9 +685,8 @@ if __name__ == "__main__":
     dummy_writer = SimpleNamespace()
     dummy_writer.add_scalar = lambda x, y, z: None
 
-    unreplicated_params = flax.jax_utils.unreplicate(agent_state.params)
     for d_idx, d_id in enumerate(args.actor_device_ids):
-        device_params = jax.device_put(unreplicated_params, local_devices[d_id])
+        device_params = jax.device_put(agent_state.params, local_devices[d_id])
         for thread_id in range(args.actor_threads_per_device):
             params_queues.append(queue.Queue(maxsize=1))
             rollout_queues.append(queue.Queue(maxsize=1))
@@ -682,7 +699,7 @@ if __name__ == "__main__":
                     rollout_queues[-1],
                     params_queues[-1],
                     writer if d_idx == 0 and thread_id == 0 else dummy_writer,
-                    learner_devices,
+                    learner_sharding,
                     d_idx * args.actor_threads_per_device + thread_id,
                     local_devices[d_id],
                 ),
@@ -721,9 +738,9 @@ if __name__ == "__main__":
             sharded_next_dones,
             learner_keys,
         )
-        unreplicated_params = flax.jax_utils.unreplicate(agent_state.params)
+
         for d_idx, d_id in enumerate(args.actor_device_ids):
-            device_params = jax.device_put(unreplicated_params, local_devices[d_id])
+            device_params = jax.device_put(agent_state.params, local_devices[d_id])
             for thread_id in range(args.actor_threads_per_device):
                 params_queues[d_idx * args.actor_threads_per_device + thread_id].put(device_params)
 
@@ -756,7 +773,7 @@ if __name__ == "__main__":
     if args.save_model and args.local_rank == 0:
         if args.distributed:
             jax.distributed.shutdown()
-        agent_state = flax.jax_utils.unreplicate(agent_state)
+        agent_state = jax.device_get(agent_state)
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         with open(model_path, "wb") as f:
             f.write(
