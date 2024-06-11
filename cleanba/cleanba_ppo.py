@@ -23,12 +23,12 @@ from flax.training.train_state import TrainState
 from rich.pretty import pprint
 from tensorboardX import SummaryWriter
 
-# Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
-os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false " "intra_op_parallelism_threads=1"
-# Fix CUDNN non-determinisim; https://github.com/google/jax/issues/4823#issuecomment-952835771
-os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic_reductions"
-os.environ["TF_CUDNN DETERMINISTIC"] = "1"
+# # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+# os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
+# os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false " "intra_op_parallelism_threads=1"
+# # Fix CUDNN non-determinisim; https://github.com/google/jax/issues/4823#issuecomment-952835771
+# os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic_reductions"
+# os.environ["TF_CUDNN DETERMINISTIC"] = "1"
 
 
 @dataclass
@@ -63,7 +63,7 @@ class Args:
     "the learning rate of the optimizer"
     local_num_envs: int = 64
     "the number of parallel game environments"
-    num_actor_threads: int = 2
+    actor_threads_per_device: int = 2
     "the number of actor threads to use"
     num_steps: int = 128
     "the number of steps to run in each environment per policy rollout"
@@ -104,6 +104,8 @@ class Args:
     "whether to run the actor and learner concurrently"
 
     # runtime arguments to be filled in
+    thread_num_envs: int = 0
+    shard_num_envs: int = 0
     local_batch_size: int = 0
     local_minibatch_size: int = 0
     num_updates: int = 0
@@ -203,13 +205,6 @@ class Actor(nn.Module):
         return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
 
 
-@flax.struct.dataclass
-class AgentParams:
-    network_params: flax.core.FrozenDict
-    actor_params: flax.core.FrozenDict
-    critic_params: flax.core.FrozenDict
-
-
 class Transition(NamedTuple):
     obs: list
     dones: list
@@ -232,7 +227,7 @@ def rollout(
     learner_devices,
     device_thread_id,
     actor_device,
-):
+    ):
     envs = make_env(
         args.env_id,
         args.seed + jax.process_index() + device_thread_id,
@@ -248,16 +243,15 @@ def rollout(
         next_obs: np.ndarray,
         key: jax.random.PRNGKey,
     ):
-        next_obs = jnp.array(next_obs)
-        hidden = Network(args.channels, args.hiddens).apply(params.network_params, next_obs)
-        logits = Actor(envs.single_action_space.n).apply(params.actor_params, hidden)
+        hidden = Network(args.channels, args.hiddens).apply(params['torso'], next_obs)
+        logits = Actor(envs.single_action_space.n).apply(params['actor'], hidden)
         # sample action: Gumbel-softmax trick
         # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
         key, subkey = jax.random.split(key)
         u = jax.random.uniform(subkey, shape=logits.shape)
         action = jnp.argmax(logits - jnp.log(-jnp.log(u)), axis=1)
         logprob = jax.nn.log_softmax(logits)[jnp.arange(action.shape[0]), action]
-        value = Critic().apply(params.critic_params, hidden)
+        value = Critic().apply(params['critic'], hidden)
         return next_obs, action, logprob, value.squeeze(), key
 
     # put data in the last index
@@ -270,7 +264,7 @@ def rollout(
     rollout_time = deque(maxlen=10)
     rollout_queue_put_time = deque(maxlen=10)
     actor_policy_version = 0
-    next_obs = envs.reset()
+    next_obs, _ = envs.reset()
     next_done = jnp.zeros(args.local_num_envs, dtype=jax.numpy.bool_)
 
     @jax.jit
@@ -295,7 +289,7 @@ def rollout(
                 # the jitted `get_action_and_value` function that hangs until the params are ready.
                 # This blocks the `get_action_and_value` function in other actor threads.
                 # See https://excalidraw.com/#json=hSooeQL707gE5SWY8wOSS,GeaN1eb2r24PPi75a3n14Q for a visual explanation.
-                params.network_params["params"]["Dense_0"][
+                params['torso']["params"]["Dense_0"][
                     "kernel"
                 ].block_until_ready()  # TODO: check if params.block_until_ready() is enough
                 actor_policy_version += 1
@@ -306,9 +300,9 @@ def rollout(
         rollout_time_start = time.time()
         storage = []
         for _ in range(0, args.num_steps):
-            cached_next_obs = next_obs
+            cached_next_obs = jnp.array(next_obs)
             cached_next_done = next_done
-            global_step += len(next_done) * args.num_actor_threads * len_actor_device_ids * args.world_size
+            global_step += len(next_done) * args.actor_threads_per_device * len_actor_device_ids * args.world_size
             inference_time_start = time.time()
             cached_next_obs, action, logprob, value, key = get_action_and_value(params, cached_next_obs, key)
             inference_time += time.time() - inference_time_start
@@ -318,7 +312,7 @@ def rollout(
             d2h_time += time.time() - d2h_time_start
 
             env_send_time_start = time.time()
-            next_obs, next_reward, next_done, info = envs.step(cpu_action)
+            next_obs, next_reward, next_done, _, info = envs.step(cpu_action)
             env_id = info["env_id"]
             env_send_time += time.time() - env_send_time_start
             storage_time_start = time.time()
@@ -398,36 +392,30 @@ def rollout(
                     args.local_num_envs
                     * args.num_steps
                     * len_actor_device_ids
-                    * args.num_actor_threads
+                    * args.actor_threads_per_device
                     * args.world_size
                     / (time.time() - update_time_start)
                 ),
                 global_step,
             )
 
+# move to dynamic local_num_envs
+# create thread_num_envs
+# comb through code and use best practices
+
+# goal here is to use sharded api
+
+# before we do anything with the config, let's remove anything that casues a soft error 
+
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    args.local_batch_size = int(args.local_num_envs * args.num_steps * args.num_actor_threads * len(args.actor_device_ids))
-    args.local_minibatch_size = int(args.local_batch_size // args.num_minibatches)
-    assert (
-        args.local_num_envs % len(args.learner_device_ids) == 0
-    ), "local_num_envs must be divisible by len(learner_device_ids)"
-    assert (
-        int(args.local_num_envs / len(args.learner_device_ids)) * args.num_actor_threads % args.num_minibatches == 0
-    ), "int(local_num_envs / len(learner_device_ids)) must be divisible by num_minibatches"
     if args.distributed:
         jax.distributed.initialize(
             local_device_ids=range(len(args.learner_device_ids) + len(args.actor_device_ids)),
         )
-        print(list(range(len(args.learner_device_ids) + len(args.actor_device_ids))))
-
     args.world_size = jax.process_count()
     args.local_rank = jax.process_index()
-    args.num_envs = args.local_num_envs * args.world_size * args.num_actor_threads * len(args.actor_device_ids)
-    args.batch_size = args.local_batch_size * args.world_size
-    args.minibatch_size = args.local_minibatch_size * args.world_size
-    args.num_updates = args.total_timesteps // (args.local_batch_size * args.world_size)
     local_devices = jax.local_devices()
     global_devices = jax.devices()
     learner_devices = [local_devices[d_id] for d_id in args.learner_device_ids]
@@ -441,6 +429,21 @@ if __name__ == "__main__":
     args.global_learner_decices = [str(item) for item in global_learner_decices]
     args.actor_devices = [str(item) for item in actor_devices]
     args.learner_devices = [str(item) for item in learner_devices]
+
+    args.local_batch_size = int(args.local_num_envs * args.num_steps * args.actor_threads_per_device * len(args.actor_device_ids))
+    args.local_minibatch_size = int(args.local_batch_size // args.num_minibatches)
+    assert (
+        args.local_num_envs % len(args.learner_device_ids) == 0
+    ), "local_num_envs must be divisible by len(learner_device_ids)"
+    assert (
+        int(args.local_num_envs / len(args.learner_device_ids)) * args.actor_threads_per_device % args.num_minibatches == 0
+    ), "int(local_num_envs / len(learner_device_ids)) must be divisible by num_minibatches"
+
+    
+    args.num_envs = args.local_num_envs * args.world_size * args.actor_threads_per_device * len(args.actor_device_ids)
+    args.batch_size = args.local_batch_size * args.world_size
+    args.minibatch_size = args.local_minibatch_size * args.world_size
+    args.num_updates = args.total_timesteps // (args.local_batch_size * args.world_size)
     pprint(args)
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{uuid.uuid4()}"
@@ -484,10 +487,10 @@ if __name__ == "__main__":
     network_params = network.init(network_key, np.array([envs.single_observation_space.sample()]))
     agent_state = TrainState.create(
         apply_fn=None,
-        params=AgentParams(
-            network_params,
-            actor.init(actor_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))),
-            critic.init(critic_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))),
+        params=dict(
+            torso=network_params,
+            actor=actor.init(actor_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))),
+            critic=critic.init(critic_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))),
         ),
         tx=optax.MultiSteps(
             optax.chain(
@@ -509,8 +512,8 @@ if __name__ == "__main__":
         params: flax.core.FrozenDict,
         obs: np.ndarray,
     ):
-        hidden = Network(args.channels, args.hiddens).apply(params.network_params, obs)
-        value = Critic().apply(params.critic_params, hidden).squeeze(-1)
+        hidden = Network(args.channels, args.hiddens).apply(params['torso'], obs)
+        value = Critic().apply(params['critic'], hidden).squeeze(-1)
         return value
 
     @jax.jit
@@ -519,14 +522,14 @@ if __name__ == "__main__":
         obs: np.ndarray,
         actions: np.ndarray,
     ):
-        hidden = Network(args.channels, args.hiddens).apply(params.network_params, obs)
-        logits = Actor(envs.single_action_space.n).apply(params.actor_params, hidden)
+        hidden = Network(args.channels, args.hiddens).apply(params['torso'], obs)
+        logits = Actor(envs.single_action_space.n).apply(params['actor'], hidden)
         logprob = jax.nn.log_softmax(logits)[jnp.arange(actions.shape[0]), actions]
         logits = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
         logits = logits.clip(min=jnp.finfo(logits.dtype).min)
         p_log_p = logits * jax.nn.softmax(logits)
         entropy = -p_log_p.sum(-1)
-        value = Critic().apply(params.critic_params, hidden).squeeze(-1)
+        value = Critic().apply(params['critic'], hidden).squeeze(-1)
         return logprob, entropy, value
 
     def compute_gae_once(carry, inp, gamma, gae_lambda):
@@ -548,7 +551,7 @@ if __name__ == "__main__":
         storage: Transition,
     ):
         next_value = critic.apply(
-            agent_state.params.critic_params, network.apply(agent_state.params.network_params, next_obs)
+            agent_state.params['critic'], network.apply(agent_state.params['torso'], next_obs)
         ).squeeze()
 
         advantages = jnp.zeros_like(next_value)
@@ -667,7 +670,7 @@ if __name__ == "__main__":
     unreplicated_params = flax.jax_utils.unreplicate(agent_state.params)
     for d_idx, d_id in enumerate(args.actor_device_ids):
         device_params = jax.device_put(unreplicated_params, local_devices[d_id])
-        for thread_id in range(args.num_actor_threads):
+        for thread_id in range(args.actor_threads_per_device):
             params_queues.append(queue.Queue(maxsize=1))
             rollout_queues.append(queue.Queue(maxsize=1))
             params_queues[-1].put(device_params)
@@ -680,7 +683,7 @@ if __name__ == "__main__":
                     params_queues[-1],
                     writer if d_idx == 0 and thread_id == 0 else dummy_writer,
                     learner_devices,
-                    d_idx * args.num_actor_threads + thread_id,
+                    d_idx * args.actor_threads_per_device + thread_id,
                     local_devices[d_id],
                 ),
             ).start()
@@ -695,7 +698,7 @@ if __name__ == "__main__":
         sharded_next_obss = []
         sharded_next_dones = []
         for d_idx, d_id in enumerate(args.actor_device_ids):
-            for thread_id in range(args.num_actor_threads):
+            for thread_id in range(args.actor_threads_per_device):
                 (
                     global_step,
                     actor_policy_version,
@@ -705,7 +708,7 @@ if __name__ == "__main__":
                     sharded_next_done,
                     avg_params_queue_get_time,
                     device_thread_id,
-                ) = rollout_queues[d_idx * args.num_actor_threads + thread_id].get()
+                ) = rollout_queues[d_idx * args.actor_threads_per_device + thread_id].get()
                 sharded_storages.append(sharded_storage)
                 sharded_next_obss.append(sharded_next_obs)
                 sharded_next_dones.append(sharded_next_done)
@@ -721,8 +724,8 @@ if __name__ == "__main__":
         unreplicated_params = flax.jax_utils.unreplicate(agent_state.params)
         for d_idx, d_id in enumerate(args.actor_device_ids):
             device_params = jax.device_put(unreplicated_params, local_devices[d_id])
-            for thread_id in range(args.num_actor_threads):
-                params_queues[d_idx * args.num_actor_threads + thread_id].put(device_params)
+            for thread_id in range(args.actor_threads_per_device):
+                params_queues[d_idx * args.actor_threads_per_device + thread_id].put(device_params)
 
         # record rewards for plotting purposes
         if learner_policy_version % args.log_frequency == 0:
@@ -761,9 +764,9 @@ if __name__ == "__main__":
                     [
                         vars(args),
                         [
-                            agent_state.params.network_params,
-                            agent_state.params.actor_params,
-                            agent_state.params.critic_params,
+                            agent_state.params['torso'],
+                            agent_state.params['actor'],
+                            agent_state.params['critic'],
                         ],
                     ]
                 )
