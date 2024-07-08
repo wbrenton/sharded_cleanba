@@ -233,7 +233,7 @@ def rollout(
     actor_device: jax.Device,
     ):
 
-    @jax.jit
+    @partial(jax.jit, device=actor_device)
     def get_action_and_value(
         params: Params,
         next_obs: jax.Array,
@@ -249,8 +249,8 @@ def rollout(
         logprob = jax.nn.log_softmax(logits)[jnp.arange(action.shape[0]), action]
         value = Critic().apply(params['critic'], hidden)
         return next_obs, action, logprob, value.squeeze(), key
-    
-    @jax.jit
+
+    @partial(jax.jit, device=actor_device)
     def prepare_data(storage: List[Transition]) -> Transition:
         return jax.tree_map(lambda *xs: jnp.stack(xs).swapaxes(0, 1), *storage) # TODO: switch to einops
 
@@ -266,13 +266,13 @@ def rollout(
     actor_policy_version = 0
     len_actor_device_ids = len(args.actor_device_ids)
     next_done = jnp.zeros(args.local_num_envs, dtype=jax.numpy.bool_)
-    
+
     envs = make_env(
         args.env_id,
         args.seed + jax.process_index() + device_thread_id,
         args.local_num_envs,
     )()
-    
+
     global_step = 0
     next_obs, _ = envs.reset()
     start_time = time.time()
@@ -354,11 +354,10 @@ def rollout(
         rollout_time.append(time.time() - rollout_time_start)
 
         avg_episodic_return = np.mean(returned_episode_returns)
-        stacked_storage = prepare_data(storage)
-        sharded_storage = jax.device_put(stacked_storage, learner_sharding)
-        # next_obs, next_done are still in the host # TODO WHY
-        sharded_next_obs = jax.device_put_sharded(np.split(next_obs, len(learner_devices)), devices=learner_devices)
-        sharded_next_done = jax.device_put_sharded(np.split(next_done, len(learner_devices)), devices=learner_devices)
+        sharded_storage = jax.device_put(prepare_data(storage), learner_sharding)
+        # next_obs, next_done are still in the host
+        sharded_next_obs = jax.device_put(prepare_data(next_obs), learner_sharding)
+        sharded_next_done = jax.device_put(prepare_data(next_done), learner_sharding)
         payload = (
             global_step,
             actor_policy_version,
@@ -402,7 +401,7 @@ def rollout(
                 ),
                 global_step,
             )
-            
+
 def make_agent_state(args: Args):
 
     def linear_schedule(count):
@@ -452,6 +451,9 @@ def make_agent_state(args: Args):
 
 # how does instadeep go about concatening a transition into one big pytree
 
+# use clu to collect stats across all ranks
+# clu can calculate steps per second for loops
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     if args.distributed:
@@ -473,7 +475,7 @@ if __name__ == "__main__":
     args.global_learner_devices = [str(item) for item in global_learner_devices]
     args.actor_devices = [str(item) for item in actor_devices]
     args.learner_devices = [str(item) for item in learner_devices]
-    
+
     # sharding (TODO: look at how other projects do this, whats the cleanest way)
     mesh = Mesh(global_learner_devices) # do I want to use global or local?
     def sharding(*partitions):
@@ -490,7 +492,6 @@ if __name__ == "__main__":
         int(args.local_num_envs / len(args.learner_device_ids)) * args.actor_threads_per_device % args.num_minibatches == 0
     ), "int(local_num_envs / len(learner_device_ids)) must be divisible by num_minibatches"
 
-    
     args.num_envs = args.local_num_envs * args.world_size * args.actor_threads_per_device * len(args.actor_device_ids)
     args.batch_size = args.local_batch_size * args.world_size
     args.minibatch_size = args.local_minibatch_size * args.world_size
